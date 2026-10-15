@@ -46,9 +46,6 @@ const (
 	// topicsDiscoveryInterval is how often upkeep runs and discovery is
 	// considered.
 	topicsDiscoveryInterval = time.Hour
-	// topicsDiscoveryMinPool is how many pooled requests it takes before
-	// discovery is worth a run and its model calls.
-	topicsDiscoveryMinPool = 100
 	// topicsDiscoveryMinSize is how many requests a discovered cluster needs
 	// to be a topic. Below it the requests stay pooled: a cluster of three is
 	// three requests, not a pattern, and naming it would spend a model call
@@ -126,8 +123,10 @@ func (s *Service) RunDiscoveryJob(ctx context.Context, job tables.TableSidekiqJo
 		return snapshot(), fmt.Errorf("read pooled requests: %w", err)
 	}
 	meta.Scanned, meta.Total = len(pool), int64(len(pool))
-	if len(pool) < topicsDiscoveryMinPool {
-		meta.Message = fmt.Sprintf("%d request(s) are waiting for a topic; discovery runs once there are %d.", len(pool), topicsDiscoveryMinPool)
+	// How many have to be waiting is the operator's setting
+	// (topic_discovery_min_requests): enough to be worth a run's model calls.
+	if minPool := config.EffectiveTopicDiscoveryMinRequests(); len(pool) < minPool {
+		meta.Message = fmt.Sprintf("%d request(s) are waiting for a topic; discovery runs once there are %d.", len(pool), minPool)
 		return snapshot(), progress(snapshot())
 	}
 	if err := checkpoint(fmt.Sprintf("Clustering %d request(s) that matched no topic.", len(pool))); err != nil {
@@ -1006,7 +1005,7 @@ func (s *Service) StartDiscoveryIfDue(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("count pooled requests: %w", err)
 	}
-	if pooled < topicsDiscoveryMinPool {
+	if pooled < int64(config.EffectiveTopicDiscoveryMinRequests()) {
 		return false, nil
 	}
 	if busy, err := s.topicsJobInFlight(ctx); err != nil || busy {

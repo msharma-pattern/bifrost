@@ -394,6 +394,9 @@ func (h *WarpHandler) startJob(ctx *fasthttp.RequestCtx, spec warpJobSpec) {
 	case errors.Is(err, warp.ErrInvalidConfig):
 		SendError(ctx, fasthttp.StatusBadRequest, err.Error())
 		return
+	case errors.Is(err, warp.ErrTopicsAlreadyBuilt):
+		SendError(ctx, fasthttp.StatusConflict, err.Error())
+		return
 	case errors.Is(err, warp.ErrUnavailable), errors.Is(err, warp.ErrNoVectorStore):
 		SendError(ctx, fasthttp.StatusServiceUnavailable, err.Error())
 		return
@@ -446,11 +449,13 @@ func (h *WarpHandler) jobStatus(ctx *fasthttp.RequestCtx, spec warpJobSpec) {
 		if err == nil && job == nil {
 			// Nothing running. A reloaded page still wants to see how the last
 			// run ended, so fall back to the newest job of any status - unless
-			// it is a backfill that ran under an embedding space that is no
-			// longer the configured one, in which case it says nothing about
-			// this space and the page shows its empty default instead.
+			// it ran under an embedding space that is no longer the configured
+			// one, in which case it says nothing about this space and the page
+			// shows its empty default instead. For topics that matters most:
+			// the run's "N topics written" sat beside "0 active topics", since
+			// its topics belong to a space nothing reads.
 			job, err = h.backfillStore.GetLatestSidekiqJobByKind(ctx, spec.kind)
-			if err == nil && job != nil && spec.kind == warp.BackfillJobKind && !h.service.BackfillMatchesConfig(ctx, job.Metadata) {
+			if err == nil && job != nil && !h.service.BackfillMatchesConfig(ctx, job.Metadata) {
 				job = nil
 			}
 		}
@@ -550,6 +555,10 @@ type warpLogIndexStatus struct {
 	// Topics is how live topic filing is doing, when the index is usable and
 	// the log store keeps topics.
 	Topics *warp.TopicHealth `json:"topics,omitempty"`
+	// HasIndexedRequests says whether the namespace holds any indexed request
+	// to seed topics from. Only while the embedding model has no topics, and
+	// absent when the vector store cannot say.
+	HasIndexedRequests *bool `json:"has_indexed_requests,omitempty"`
 }
 
 const (
@@ -592,6 +601,16 @@ func (h *WarpHandler) logIndexStatus(ctx *fasthttp.RequestCtx) {
 			status.Topics = &health
 		} else if !errors.Is(err, warp.ErrUnavailable) {
 			logger.Warn("failed to read Warp topic health for index status: %v", err)
+		}
+		// Before the first topics, the settings page needs to know whether a
+		// seed run would find anything; after, the read would be wasted on
+		// every poll.
+		if status.Topics != nil && status.Topics.ActiveTopics == 0 {
+			if indexed, err := h.service.HasIndexedRequests(ctx); err == nil {
+				status.HasIndexedRequests = &indexed
+			} else {
+				logger.Warn("failed to check for indexed Warp requests: %v", err)
+			}
 		}
 	}
 	if h.backfillStore == nil || status.State != warpIndexStateReady {

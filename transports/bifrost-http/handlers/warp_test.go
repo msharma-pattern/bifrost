@@ -80,18 +80,27 @@ func (handlerVectorStore) Close(context.Context, string) error { return nil }
 
 func newBackfillTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, func()) {
 	t.Helper()
+	handler, jobs, _, cleanup := newTopicsTestHandler(t)
+	return handler, jobs, cleanup
+}
+
+// newTopicsTestHandler is newBackfillTestHandler with the log store the
+// topics live in, for a test that writes them.
+func newTopicsTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, logstore.LogStore, func()) {
+	t.Helper()
+	topics := handlerTopicStore(t)
 	config := &recordingWarpStore{row: &tables.TableWarpConfig{
 		ID: tables.WarpConfigRowID, Enabled: true, Provider: "openai", Model: "gpt-4o",
 		EmbeddingProvider: "openai", EmbeddingModel: "embed", EmbeddingDimension: 2, LogVectorStoreNamespace: "WarpLogs",
 	}}
 	jobs := newFakeSidekiqStore()
 	runner := sidekiq.New(jobs, &mockLogger{}, 1, "")
-	service := warp.NewService(nil, warp.WithConfigStore(config), warp.WithLogReader(handlerBackfillReader{topics: handlerTopicStore(t)}), warp.WithVectorStore(handlerVectorStore{}), warp.WithEmbeddingExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+	service := warp.NewService(nil, warp.WithConfigStore(config), warp.WithLogReader(handlerBackfillReader{topics: topics}), warp.WithVectorStore(handlerVectorStore{}), warp.WithEmbeddingExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
 		return &schemas.BifrostEmbeddingResponse{Data: []schemas.EmbeddingData{{Embedding: schemas.EmbeddingStruct{EmbeddingArray: []float64{0, 1}}}}}, nil
 	}))
 	service.RegisterBackfill(runner)
 	handler := &WarpHandler{service: service, sidekiqRunner: runner, backfillStore: jobs}
-	return handler, jobs, func() { runner.Shutdown(); service.Shutdown() }
+	return handler, jobs, topics, func() { runner.Shutdown(); service.Shutdown() }
 }
 
 // handlerTopicStore is a real SQLite log store: topics are rows in it, and a
@@ -276,6 +285,8 @@ func TestWarpLogIndexStatusSummarisesState(t *testing.T) {
 	require.Contains(t, body, `"vector_store_connected":true`)
 	// Live filing comes with a usable index: nothing built, nothing filed.
 	require.Contains(t, body, `"topics":{"active_topics":0,"themes":0,"pooled":0,"requests_24h":0,"unmatched_24h":0,"unmatched_share_24h":0}`)
+	// No topics yet, so whether there is anything to seed them from is asked.
+	require.Contains(t, body, `"has_indexed_requests":false`)
 
 	jobs.latest = &tables.TableSidekiqJob{ID: "job-f", Kind: warp.BackfillJobKind, Status: tables.SidekiqStatusFailed, LastError: "no keys found", Metadata: `{"scanned":100,"failed":100,"total":5000}`}
 	ctx = adminCtx("")
@@ -468,6 +479,55 @@ func TestWarpBackfillStatusHidesJobFromAnotherEmbeddingSpace(t *testing.T) {
 	statusCtx = adminCtx("")
 	handler.backfillStatus(statusCtx)
 	require.Contains(t, string(statusCtx.Response.Body()), `"id":"job-running"`)
+}
+
+// The topics panel shows how the last run ended only when that run built
+// topics for the embedding model in use. A run under a model since replaced
+// said "95 topics written" beside "0 active topics", because its topics belong
+// to an embedding space nothing reads any more.
+func TestWarpTopicsStatusHidesRunFromAnotherEmbeddingSpace(t *testing.T) {
+	handler, jobs, _, cleanup := newTopicsTestHandler(t)
+	defer cleanup()
+	jobs.latest = &tables.TableSidekiqJob{
+		ID: "run-old-space", Kind: warp.TopicsJobKind, Status: tables.SidekiqStatusCompleted,
+		Metadata: `{"config_signature":"6:openai|22:text-embedding-3-small|4:1536|15:BifrostWarpLogs|","scanned":7015,"indexed":95}`,
+	}
+	statusCtx := adminCtx("")
+	handler.topicsStatus(statusCtx)
+	require.Equal(t, fasthttp.StatusOK, statusCtx.Response.StatusCode())
+	require.Contains(t, string(statusCtx.Response.Body()), `"status":"idle"`)
+
+	metadata, err := handler.service.BuildTopicsJobMeta(context.Background(), time.Unix(1, 0), time.Unix(2, 0))
+	require.NoError(t, err)
+	jobs.latest.Metadata = metadata
+	statusCtx = adminCtx("")
+	handler.topicsStatus(statusCtx)
+	require.Contains(t, string(statusCtx.Response.Body()), `"id":"run-old-space"`)
+}
+
+// A seed run for an embedding model that has topics already is refused with
+// 409 and says why, rather than replacing topics that keep themselves current.
+func TestWarpTopicsStartRefusesASecondSeedRun(t *testing.T) {
+	handler, _, topics, cleanup := newTopicsTestHandler(t)
+	defer cleanup()
+	metadata, err := handler.service.BuildTopicsJobMeta(context.Background(), time.Unix(1, 0), time.Unix(2, 0))
+	require.NoError(t, err)
+	var meta struct {
+		ConfigSignature string `json:"config_signature"`
+	}
+	require.NoError(t, sonic.UnmarshalString(metadata, &meta))
+	require.NoError(t, topics.UpsertWarpTopics(context.Background(), []logstore.WarpTopic{{ID: "seeded", Label: "Refunds", EmbeddingSignature: meta.ConfigSignature}}))
+
+	ctx := adminCtx(`{"start_time":"2026-09-01T00:00:00Z","end_time":"2026-09-02T00:00:00Z"}`)
+	handler.startTopics(ctx)
+	require.Equal(t, fasthttp.StatusConflict, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+	require.Contains(t, string(ctx.Response.Body()), "already built")
+
+	// Seeded, the index status stops asking whether there is anything to seed
+	// from: the vector store read is only paid while it matters.
+	statusCtx := adminCtx("")
+	handler.logIndexStatus(statusCtx)
+	require.NotContains(t, string(statusCtx.Response.Body()), "has_indexed_requests")
 }
 
 func TestWarpBackfillStatusWithoutAnyJobIsIdle(t *testing.T) {
