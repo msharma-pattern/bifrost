@@ -692,8 +692,10 @@ type Config struct {
 
 	// Stores
 	ConfigStore configstore.ConfigStore
-	VectorStore vectorstore.VectorStore
-	LogsStore   logstore.LogStore
+	// ConfigStoreConfig is the effective config store configuration used to create ConfigStore.
+	ConfigStoreConfig *configstore.Config
+	VectorStore       vectorstore.VectorStore
+	LogsStore         logstore.LogStore
 	// LogsStoreConfig is the effective logs store configuration used to create LogsStore.
 	LogsStoreConfig *logstore.Config
 	ObjectStore     objectstore.ObjectStore
@@ -1270,6 +1272,7 @@ func initStores(ctx context.Context, config *Config, configData *ConfigData, con
 		if err != nil {
 			return err
 		}
+		config.ConfigStoreConfig = configData.ConfigStoreConfig
 		logger.Info("config store initialized")
 	} else if configData.ConfigStoreConfig == nil {
 		// No config store section — create default SQLite store for persistence
@@ -1283,6 +1286,7 @@ func initStores(ctx context.Context, config *Config, configData *ConfigData, con
 		if err != nil {
 			return fmt.Errorf("failed to initialize default config store: %w", err)
 		}
+		config.ConfigStoreConfig = &configstore.Config{Enabled: true, Type: configstore.ConfigStoreTypeSQLite, Config: &configstore.SQLiteConfig{Path: configDBPath}}
 		logger.Info("config store initialized (default SQLite)")
 	}
 	// else: ConfigStoreConfig is present but Enabled == false — leave ConfigStore nil
